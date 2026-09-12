@@ -130,11 +130,11 @@ func (m *BluetoothManager) monitorDisconnects() {
 
 				changes := signal.Body[1].(map[string]dbus.Variant)
 				if connected, ok := changes["Connected"]; ok {
-					if !connected.Value().(bool) {
-						devicePath := string(signal.Path)
-						address := strings.TrimPrefix(devicePath, string(m.adapter)+"/dev_")
-						address = strings.ReplaceAll(address, "_", ":")
+					devicePath := string(signal.Path)
+					address := strings.TrimPrefix(devicePath, string(m.adapter)+"/dev_")
+					address = strings.ReplaceAll(address, "_", ":")
 
+					if !connected.Value().(bool) {
 						if _, exists := m.pendingDisconnects.LoadAndDelete(address); !exists {
 							if m.wsHub != nil {
 								m.wsHub.Broadcast(utils.WebSocketEvent{
@@ -153,6 +153,9 @@ func (m *BluetoothManager) monitorDisconnects() {
 							m.agent.current = nil
 							m.mu.Unlock()
 						}
+					} else {
+						log.Printf("Device reconnected: %s, attempting network reconnect", address)
+						go m.tryReconnectNetwork(address)
 					}
 				}
 			}
@@ -182,6 +185,37 @@ func (m *BluetoothManager) monitorNetworkInterfaces() {
 			}
 		}
 	}()
+}
+
+func (m *BluetoothManager) tryReconnectNetwork(address string) {
+	link, err := netlink.LinkByName("bnep0")
+	if err == nil && link.Attrs().Flags&net.FlagUp != 0 {
+		return
+	}
+
+	devicePath := formatDevicePath(m.adapter, address)
+	obj := m.conn.Object(BLUEZ_BUS_NAME, devicePath)
+
+	if err := obj.Call("org.bluez.Network1.Connect", 0, "nap").Err; err != nil {
+		log.Printf("Network reconnect for %s skipped: %v", address, err)
+		return
+	}
+
+	link, err = netlink.LinkByName("bnep0")
+	if err != nil || link.Attrs().Flags&net.FlagUp == 0 {
+		log.Printf("bnep0 not up after reconnect for %s", address)
+		return
+	}
+
+	log.Printf("Network reconnected via %s", address)
+	if m.wsHub != nil {
+		m.wsHub.Broadcast(utils.WebSocketEvent{
+			Type: "bluetooth/network/connect",
+			Payload: utils.NetworkConnectedPayload{
+				Address: address,
+			},
+		})
+	}
 }
 
 func (m *BluetoothManager) setPower(enable bool) error {

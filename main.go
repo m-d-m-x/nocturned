@@ -17,6 +17,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/vishvananda/netlink"
 
+	"github.com/usenocturne/nocturned/audio"
 	"github.com/usenocturne/nocturned/bluetooth"
 	"github.com/usenocturne/nocturned/utils"
 )
@@ -124,6 +125,8 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to initialize bluetooth manager:", err)
 	}
+
+	audioManager := audio.NewManager(wsHub)
 
 	if err := utils.InitBrightness(); err != nil {
 		log.Printf("Failed to initialize brightness: %v", err)
@@ -900,6 +903,121 @@ func main() {
 			json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to write JSON: " + err.Error()})
 			return
 		}
+	}))
+
+	// POST /audio/transcribe/start
+	http.HandleFunc("/audio/transcribe/start", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req struct {
+			Provider string `json:"provider"`
+			APIKey   string `json:"apiKey"`
+			Lang     string `json:"lang"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body: " + err.Error()})
+			return
+		}
+
+		if err := audioManager.Start(audio.StartParams{
+			Provider: req.Provider,
+			APIKey:   req.APIKey,
+			Lang:     req.Lang,
+		}); err != nil {
+			w.WriteHeader(http.StatusConflict)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /audio/transcribe/stop
+	http.HandleFunc("/audio/transcribe/stop", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := audioManager.Stop(); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /audio/transcribe/cancel
+	http.HandleFunc("/audio/transcribe/cancel", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		if err := audioManager.Cancel(); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	const configPath = "/etc/nocturne/config.json"
+
+	// GET /config — read device config; POST /config — write device config
+	http.HandleFunc("/config", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			data, err := os.ReadFile(configPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(map[string]interface{}{})
+					return
+				}
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read config: " + err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			w.Write(data)
+			return
+		}
+		if r.Method == "POST" {
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to read body: " + err.Error()})
+				return
+			}
+			var tmp map[string]interface{}
+			if err := json.Unmarshal(body, &tmp); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid JSON: " + err.Error()})
+				return
+			}
+			if err := os.WriteFile(configPath, body, 0644); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ErrorResponse{Error: "Failed to write config: " + err.Error()})
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
 	}))
 
 	go networkChecker(wsHub)

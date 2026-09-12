@@ -48,3 +48,8 @@ type DevicePairedPayload struct {
 type NetworkConnectedPayload struct {
 	Address string `json:"address"`
 }
+
+type VoiceTranscriptPayload struct {
+	Text  string `json:"text,omitempty"`
+	Error string `json:"error,omitempty"`
+}
