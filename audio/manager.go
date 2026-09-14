@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"os"
@@ -28,12 +27,12 @@ const (
 // Silence detection tuning.
 //
 // A fixed RMS threshold assumes a hot microphone. The Car Thing's PDM mic has
-// no gain control (amixer exposes no capture element) and idles around RMS 6,
-// so an 800 threshold meant speech never registered: every window counted as
-// silence, captures auto-stopped at the 3s minimum, and the speech guard threw
-// the recording away. The threshold is therefore derived from the quietest
-// window actually observed in each capture, with the old constant kept as the
-// ceiling for genuinely noisy environments.
+// no gain control (amixer exposes no capture element) and idles around RMS 6-34
+// with speech peaking at 300-480, so a fixed 800 meant speech never registered:
+// every window counted as silence, captures auto-stopped at the minimum, and
+// the speech guard threw the recording away. The threshold is therefore derived
+// from the quietest window actually observed in each capture, with the old
+// constant kept as the ceiling for genuinely noisy environments.
 const (
 	checkInterval   = 200 * time.Millisecond
 	silenceRequired = 1.4 // seconds of continuous silence before auto-stop
@@ -48,6 +47,14 @@ const (
 	// while a transient click barely moves a one-second average.
 	minSpeechWindows = 2
 
+	// Discarding a real utterance makes voice unusable; letting a silent one
+	// through costs one spurious search. So a capture is only thrown away when
+	// two independent signals agree there was no speech: no sustained
+	// above-threshold windows, AND a peak that never rose meaningfully above
+	// the noise floor. Measured: speech registers 5-11 windows (peak 303-480),
+	// silence registers 0 (peak 101-183).
+	discardPeakFactor = 20.0
+
 	wavHeaderSize  = 44
 	sampleRate     = 16000
 	bytesPerSample = 2
@@ -57,21 +64,12 @@ const (
 	trimPadBytes = int64(0.25 * sampleRate * bytesPerSample)
 	// Never trim down to something too short to be a real utterance.
 	minTrimmedBytes = int64(0.6 * sampleRate * bytesPerSample)
-
-	// Discarding a real utterance makes voice unusable; letting a silent one
-	// through costs one spurious search. So a capture is only thrown away when
-	// two independent signals agree there was no speech: no sustained
-	// above-threshold windows, AND a peak that never rose meaningfully above
-	// the noise floor.
-	//
-	// This factor was 6 while no speech measurements existed, which was wide
-	// enough that silent captures still reached Whisper and came back as
-	// hallucinated phrases. Measured since: speech registers 5-11 windows
-	// (peak 303-480), silence registers 0 (peak 101-183). The window count
-	// separates them cleanly, so this second signal only has to cover the
-	// unobserved case where windows undercount on genuinely loud audio.
-	discardPeakFactor = 20.0
 )
+
+// ErrNoCapture means there was no session to act on. Callers should treat this
+// as a no-op rather than a failure: with silence-driven auto-stop, the daemon
+// routinely ends a session before the client gets around to asking it to.
+var ErrNoCapture = errors.New("no capture in progress")
 
 func storeFloat(a *atomic.Uint64, v float64) { a.Store(math.Float64bits(v)) }
 func loadFloat(a *atomic.Uint64) float64     { return math.Float64frombits(a.Load()) }
@@ -91,45 +89,67 @@ func adaptiveThreshold(floor float64) float64 {
 	return t
 }
 
-// ErrNoCapture means there was no capture to act on. Callers should treat this
-// as a no-op rather than a failure: with silence-driven auto-stop, the daemon
-// routinely stops a session before the client gets around to asking it to.
-var ErrNoCapture = errors.New("no capture in progress")
+// session is a window onto the always-on ring rather than a recording process.
+// It records where in the stream the utterance began; the microphone itself is
+// never opened or closed for it.
+type session struct {
+	startOffset int64
+	provider    string
+	apiKey      string
+	lang        string
+	started     time.Time
 
-type captureSession struct {
-	cmd      *exec.Cmd
-	wavPath  string
-	provider string
-	apiKey   string
-	lang     string
-	started  time.Time
-
-	// Set by the silence detector. evaluated means it got far enough to measure
-	// anything at all; sawSpeech means at least one window crossed the
-	// threshold. Both are read from stop(), on another goroutine.
-	evaluated atomic.Bool
-	sawSpeech atomic.Bool
-
-	// float64 bits, written by the detector and read by stop().
+	evaluated     atomic.Bool
+	sawSpeech     atomic.Bool
 	peakRms       atomic.Uint64
 	floorRms      atomic.Uint64
 	threshold     atomic.Uint64
 	speechWindows atomic.Uint32
 
-	// File offsets at the first and last tick that measured speech, used to
-	// trim the silence the detector deliberately waits through.
+	// Absolute ring offsets at the first and last tick that measured speech.
 	firstSpeechAt atomic.Int64
 	lastSpeechAt  atomic.Int64
 }
 
 type Manager struct {
 	mu      sync.Mutex
-	current *captureSession
+	current *session
 	wsHub   *utils.WebSocketHub
+	capture *Capture
 }
 
+// NewManager builds the manager and opens the microphone. Capture is
+// continuous for the lifetime of the daemon: wake-word detection needs the
+// stream always running, and sessions read from it rather than starting it.
 func NewManager(wsHub *utils.WebSocketHub) *Manager {
-	return &Manager{wsHub: wsHub}
+	m := &Manager{wsHub: wsHub, capture: NewCapture()}
+	m.capture.Start()
+	return m
+}
+
+// Close releases the microphone.
+func (m *Manager) Close() {
+	if m.capture != nil {
+		m.capture.Stop()
+	}
+}
+
+// Ring exposes the live audio stream so a wake-word detector can read it
+// alongside the session logic, without either owning the microphone.
+func (m *Manager) Ring() *Ring { return m.capture.Ring() }
+
+func (m *Manager) broadcastState(state string) {
+	m.wsHub.Broadcast(utils.WebSocketEvent{
+		Type:    "voice_state",
+		Payload: utils.VoiceStatePayload{State: state},
+	})
+}
+
+func (m *Manager) broadcastError(msg string) {
+	m.wsHub.Broadcast(utils.WebSocketEvent{
+		Type:    "voice_transcript",
+		Payload: utils.VoiceTranscriptPayload{Error: msg},
+	})
 }
 
 type StartParams struct {
@@ -138,6 +158,10 @@ type StartParams struct {
 	Lang     string
 }
 
+// Start opens a session over the live audio stream. It reaches back by
+// PreRollBytes so the beginning of the utterance is not lost to trigger latency
+// - and, once a wake word drives this, so the words spoken immediately after
+// the phrase are already in hand.
 func (m *Manager) Start(p StartParams) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -145,238 +169,174 @@ func (m *Manager) Start(p StartParams) error {
 	if m.current != nil {
 		return fmt.Errorf("capture already in progress")
 	}
-
 	if p.Provider == "" {
 		p.Provider = "groq"
 	}
 	if p.APIKey == "" {
 		return fmt.Errorf("apiKey is required")
 	}
-
-	tmp, err := os.CreateTemp("", "nocturne-voice-*.wav")
-	if err != nil {
-		return fmt.Errorf("failed to create temp wav: %v", err)
-	}
-	wavPath := tmp.Name()
-	tmp.Close()
-	os.Remove(wavPath)
-
-	cmd := exec.Command(
-		"arecord",
-		"-q",
-		"-D", captureDevice,
-		"-f", captureFormat,
-		"-r", captureRate,
-		"-c", captureChans,
-		"-t", "wav",
-		"-d", fmt.Sprintf("%d", captureMaxSec),
-		wavPath,
-	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start arecord: %v", err)
+	if !m.capture.Running() {
+		return fmt.Errorf("microphone is not capturing")
 	}
 
-	m.current = &captureSession{
-		cmd:      cmd,
-		wavPath:  wavPath,
-		provider: p.Provider,
-		apiKey:   p.APIKey,
-		lang:     p.Lang,
-		started:  time.Now(),
+	ring := m.capture.Ring()
+	start := ring.Written() - PreRollBytes()
+	if oldest := ring.Oldest(); start < oldest {
+		start = oldest
 	}
 
-	log.Printf("audio capture started: %s", wavPath)
+	s := &session{
+		startOffset: start,
+		provider:    p.Provider,
+		apiKey:      p.APIKey,
+		lang:        p.Lang,
+		started:     time.Now(),
+	}
+	m.current = s
+
+	log.Printf("audio: session opened at ring offset %d", start)
 	m.broadcastState("recording")
-	go m.startSilenceDetector(m.current)
+	go m.watchForSilence(s)
 	return nil
 }
 
-func (m *Manager) Stop() error {
-	return m.stop("manual")
-}
+func (m *Manager) Stop() error { return m.stop("manual") }
 
 func (m *Manager) stop(reason string) error {
 	m.mu.Lock()
-	session := m.current
+	s := m.current
 	m.current = nil
 	m.mu.Unlock()
 
-	if session == nil {
+	if s == nil {
 		return ErrNoCapture
 	}
 
-	if err := terminate(session.cmd); err != nil {
-		log.Printf("audio: terminate error: %v", err)
-	}
-	_ = session.cmd.Wait()
+	ring := m.capture.Ring()
+	endOffset := ring.Written()
+	durationMs := time.Since(s.started).Milliseconds()
 
-	st, err := os.Stat(session.wavPath)
-	if err != nil || st.Size() == 0 {
-		os.Remove(session.wavPath)
-		log.Printf("audio: stop(%s) but recording produced no audio", reason)
-		m.broadcastError("recording produced no audio")
-		return fmt.Errorf("recording produced no audio")
-	}
+	peak := loadFloat(&s.peakRms)
+	floor := loadFloat(&s.floorRms)
+	threshold := loadFloat(&s.threshold)
+	windows := s.speechWindows.Load()
 
-	durationMs := time.Since(session.started).Milliseconds()
-
-	// Whisper hallucinates confident phrases ("Thank you.", "Thanks for
-	// watching!") out of silence, and the client acts on whatever comes back -
-	// so an accidental dial press would start playing music. If the detector ran
-	// and never once measured audio above the threshold, there is nothing worth
-	// transcribing: discard it and skip the API call entirely.
-	//
-	// evaluated gates this: a manual stop inside minRecordTime never measured
-	// anything, and must not be mistaken for silence.
-	peak := loadFloat(&session.peakRms)
-	floor := loadFloat(&session.floorRms)
-	threshold := loadFloat(&session.threshold)
-	windows := session.speechWindows.Load()
-
+	// Whisper hallucinates confident phrases out of silence ("Thank you."), and
+	// the client acts on whatever comes back - so an accidental trigger would
+	// start playing music. evaluated gates this: a stop inside minRecordTime
+	// never measured anything and must not be mistaken for silence.
 	quiet := peak < floor*discardPeakFactor
-	if session.evaluated.Load() && !session.sawSpeech.Load() && quiet {
-		os.Remove(session.wavPath)
+	if s.evaluated.Load() && !s.sawSpeech.Load() && quiet {
 		log.Printf(
-			"audio: discarded %dms capture - %d speech windows, peak rms %.0f vs threshold %.0f, floor %.0f",
+			"audio: discarded %dms session - %d speech windows, peak rms %.0f vs threshold %.0f, floor %.0f",
 			durationMs, windows, peak, threshold, floor,
 		)
 		m.wsHub.Broadcast(utils.WebSocketEvent{
 			Type: "voice_state",
 			Payload: utils.VoiceStatePayload{
-				State:      "discarded",
-				Reason:     reason,
-				DurationMs: durationMs,
-				Bytes:      st.Size(),
-				PeakRMS:    peak,
-				FloorRMS:   floor,
-				Threshold:  threshold,
-				Windows:    windows,
+				State: "discarded", Reason: reason, DurationMs: durationMs,
+				Bytes: endOffset - s.startOffset, PeakRMS: peak,
+				FloorRMS: floor, Threshold: threshold, Windows: windows,
 			},
 		})
 		m.broadcastError("no speech detected")
 		return nil
 	}
 
-	uploadBytes := st.Size()
-	if trimmed, err := trimWavToSpeech(
-		session.wavPath,
-		session.firstSpeechAt.Load(),
-		session.lastSpeechAt.Load(),
-	); err != nil {
-		log.Printf("audio: trim failed, sending full capture: %v", err)
-	} else {
-		uploadBytes = trimmed
+	from, to := speechRange(s.startOffset, endOffset, s.firstSpeechAt.Load(), s.lastSpeechAt.Load())
+	pcm, err := ring.Read(from, to)
+	if err != nil {
+		log.Printf("audio: could not read session audio: %v", err)
+		m.broadcastError("recording was lost")
+		return err
+	}
+	if len(pcm) == 0 {
+		m.broadcastError("recording produced no audio")
+		return fmt.Errorf("recording produced no audio")
 	}
 
+	wavPath, err := tempWavPath()
+	if err != nil {
+		m.broadcastError(err.Error())
+		return err
+	}
+	if err := writeWav(wavPath, pcm); err != nil {
+		m.broadcastError(err.Error())
+		return err
+	}
+
+	uploadBytes := int64(wavHeaderSize + len(pcm))
 	log.Printf(
 		"audio: stopped (%s) after %dms, %d -> %d bytes (%s), %d speech windows, peak rms %.0f, floor %.0f, threshold %.0f",
-		reason, durationMs, st.Size(), uploadBytes, durationString(uploadBytes),
+		reason, durationMs, endOffset-s.startOffset, uploadBytes, durationString(int64(len(pcm))),
 		windows, peak, floor, threshold,
 	)
 
 	m.wsHub.Broadcast(utils.WebSocketEvent{
 		Type: "voice_state",
 		Payload: utils.VoiceStatePayload{
-			State:      "transcribing",
-			Reason:     reason,
-			DurationMs: durationMs,
-			Bytes:      uploadBytes,
-			PeakRMS:    peak,
-			FloorRMS:   floor,
-			Threshold:  threshold,
-			Windows:    windows,
+			State: "transcribing", Reason: reason, DurationMs: durationMs,
+			Bytes: uploadBytes, PeakRMS: peak, FloorRMS: floor,
+			Threshold: threshold, Windows: windows,
 		},
 	})
 
-	go m.transcribeAndBroadcast(session)
+	go m.transcribeAndBroadcast(s, wavPath)
 	return nil
 }
 
 func (m *Manager) Cancel() error {
 	m.mu.Lock()
-	session := m.current
+	s := m.current
 	m.current = nil
 	m.mu.Unlock()
 
-	if session == nil {
+	if s == nil {
 		return nil
 	}
-
-	_ = kill(session.cmd)
-	_ = session.cmd.Wait()
-	os.Remove(session.wavPath)
 	m.broadcastState("cancelled")
 	return nil
 }
 
-func (m *Manager) startSilenceDetector(session *captureSession) {
-	chunkBytes := windowBytes
+// watchForSilence reads the tail of the ring rather than polling a growing
+// file, so it always sees a complete measurement window and never has to guess
+// whether a partially-written buffer is trustworthy.
+func (m *Manager) watchForSilence(s *session) {
 	silenceSecs := 0.0
-	startTime := time.Now()
 	peak := 0.0
 	floor := math.Inf(1)
+	ring := m.capture.Ring()
 
 	for {
 		time.Sleep(checkInterval)
 
 		m.mu.Lock()
-		alive := m.current == session
+		alive := m.current == s
 		m.mu.Unlock()
 		if !alive {
 			return
 		}
 
-		if time.Since(startTime).Seconds() < minRecordTime {
-			continue
-		}
-
-		// arecord exits on its own at the -d cap, but nothing else would notice:
-		// the file stops growing, so in a noisy car the RMS window stays loud and
-		// silence never accumulates. Without this the session hangs forever and
-		// a full-length utterance is thrown away instead of transcribed.
-		if time.Since(startTime).Seconds() >= float64(captureMaxSec) {
-			log.Printf("audio: reached %ds capture cap, stopping", captureMaxSec)
+		now := ring.Written()
+		if time.Since(s.started).Seconds() >= float64(captureMaxSec) {
+			log.Printf("audio: reached %ds session cap, stopping", captureMaxSec)
 			go m.stop("cap")
 			return
 		}
-
-		f, err := os.Open(session.wavPath)
-		if err != nil {
+		if time.Since(s.started).Seconds() < minRecordTime {
 			continue
 		}
-		stat, err := f.Stat()
-		if err != nil || stat.Size()-int64(wavHeaderSize) < chunkBytes {
-			f.Close()
+		// Need a full window of audio before any measurement means anything.
+		if now-s.startOffset < windowBytes {
 			continue
 		}
 
-		offset := stat.Size() - chunkBytes
-		if offset < int64(wavHeaderSize) {
-			offset = int64(wavHeaderSize)
-		}
-		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			f.Close()
+		pcm, err := ring.Read(now-windowBytes, now)
+		if err != nil || len(pcm) < bytesPerSample {
 			continue
 		}
 
-		buf := make([]byte, chunkBytes)
-		n, _ := f.Read(buf)
-		f.Close()
-
-		if n < 2 {
-			continue
-		}
-
-		samples := n / 2
-		var sumSq float64
-		for i := 0; i < samples; i++ {
-			s := int16(binary.LittleEndian.Uint16(buf[i*2 : i*2+2]))
-			sumSq += float64(s) * float64(s)
-		}
-		rms := math.Sqrt(sumSq / float64(samples))
-
+		rms := rmsOfPCM(pcm)
 		if rms > peak {
 			peak = rms
 		}
@@ -385,19 +345,19 @@ func (m *Manager) startSilenceDetector(session *captureSession) {
 		}
 		threshold := adaptiveThreshold(floor)
 
-		session.evaluated.Store(true)
-		storeFloat(&session.peakRms, peak)
-		storeFloat(&session.floorRms, floor)
-		storeFloat(&session.threshold, threshold)
+		s.evaluated.Store(true)
+		storeFloat(&s.peakRms, peak)
+		storeFloat(&s.floorRms, floor)
+		storeFloat(&s.threshold, threshold)
 
 		if rms < threshold {
 			silenceSecs += checkInterval.Seconds()
 		} else {
 			silenceSecs = 0
-			session.firstSpeechAt.CompareAndSwap(0, stat.Size())
-			session.lastSpeechAt.Store(stat.Size())
-			if session.speechWindows.Add(1) >= minSpeechWindows {
-				session.sawSpeech.Store(true)
+			s.firstSpeechAt.CompareAndSwap(0, now)
+			s.lastSpeechAt.Store(now)
+			if s.speechWindows.Add(1) >= minSpeechWindows {
+				s.sawSpeech.Store(true)
 			}
 		}
 
@@ -409,11 +369,34 @@ func (m *Manager) startSilenceDetector(session *captureSession) {
 	}
 }
 
-func (m *Manager) transcribeAndBroadcast(s *captureSession) {
-	defer os.Remove(s.wavPath)
+func rmsOfPCM(pcm []byte) float64 {
+	samples := len(pcm) / bytesPerSample
+	if samples == 0 {
+		return 0
+	}
+	var sumSq float64
+	for i := 0; i < samples; i++ {
+		v := int16(binary.LittleEndian.Uint16(pcm[i*2 : i*2+2]))
+		sumSq += float64(v) * float64(v)
+	}
+	return math.Sqrt(sumSq / float64(samples))
+}
+
+func tempWavPath() (string, error) {
+	tmp, err := os.CreateTemp("", "nocturne-voice-*.wav")
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp wav: %v", err)
+	}
+	path := tmp.Name()
+	tmp.Close()
+	return path, nil
+}
+
+func (m *Manager) transcribeAndBroadcast(s *session, wavPath string) {
+	defer os.Remove(wavPath)
 
 	begin := time.Now()
-	text, err := transcribe(s.provider, s.apiKey, s.lang, s.wavPath)
+	text, err := transcribe(s.provider, s.apiKey, s.lang, wavPath)
 	elapsed := time.Since(begin).Milliseconds()
 
 	if err != nil {
@@ -423,29 +406,10 @@ func (m *Manager) transcribeAndBroadcast(s *captureSession) {
 	}
 
 	log.Printf("audio: transcript via %s in %dms: %q", s.provider, elapsed, text)
-
 	m.wsHub.Broadcast(utils.WebSocketEvent{
 		Type: "voice_transcript",
 		Payload: utils.VoiceTranscriptPayload{
-			Text:      text,
-			Provider:  s.provider,
-			ElapsedMs: elapsed,
-		},
-	})
-}
-
-func (m *Manager) broadcastState(state string) {
-	m.wsHub.Broadcast(utils.WebSocketEvent{
-		Type:    "voice_state",
-		Payload: utils.VoiceStatePayload{State: state},
-	})
-}
-
-func (m *Manager) broadcastError(msg string) {
-	m.wsHub.Broadcast(utils.WebSocketEvent{
-		Type: "voice_transcript",
-		Payload: utils.VoiceTranscriptPayload{
-			Error: msg,
+			Text: text, Provider: s.provider, ElapsedMs: elapsed,
 		},
 	})
 }
@@ -460,15 +424,3 @@ func terminate(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Signal(syscall.SIGTERM)
 }
-
-func kill(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err == nil {
-		return syscall.Kill(-pgid, syscall.SIGKILL)
-	}
-	return cmd.Process.Kill()
-}
-
