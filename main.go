@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -947,6 +948,14 @@ func main() {
 		}
 
 		if err := audioManager.Stop(); err != nil {
+			// The silence detector may already have stopped and handed the
+			// recording off to transcription. A client asking again is late,
+			// not wrong - don't turn that into a visible error.
+			if errors.Is(err, audio.ErrNoCapture) {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"status": "already_stopped"})
+				return
+			}
 			w.WriteHeader(http.StatusBadRequest)
 			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
 			return

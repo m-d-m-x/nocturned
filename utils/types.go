@@ -50,6 +50,25 @@ type NetworkConnectedPayload struct {
 }
 
 type VoiceTranscriptPayload struct {
-	Text  string `json:"text,omitempty"`
-	Error string `json:"error,omitempty"`
+	Text      string `json:"text,omitempty"`
+	Error     string `json:"error,omitempty"`
+	Provider  string `json:"provider,omitempty"`
+	ElapsedMs int64  `json:"elapsedMs,omitempty"`
+}
+
+// VoiceStatePayload reports capture lifecycle transitions the client did not
+// initiate - most importantly the silence detector auto-stopping - so the UI
+// can follow along without owning the stop itself.
+type VoiceStatePayload struct {
+	State string `json:"state"` // recording | transcribing | discarded | cancelled
+
+	// Present on "transcribing" so the client can log what was actually
+	// captured: why it stopped, how long, how big, and the RMS that tripped it.
+	Reason     string  `json:"reason,omitempty"` // silence | cap | manual
+	DurationMs int64   `json:"durationMs,omitempty"`
+	Bytes      int64   `json:"bytes,omitempty"`
+	PeakRMS    float64 `json:"peakRms,omitempty"`
+	FloorRMS   float64 `json:"floorRms,omitempty"`
+	Threshold  float64 `json:"threshold,omitempty"`
+	Windows    uint32  `json:"windows,omitempty"`
 }
