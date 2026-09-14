@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 )
@@ -39,15 +41,47 @@ type errorEnvelope struct {
 	} `json:"error"`
 }
 
+// Groq's upload path is the bottleneck, not its inference: measured from the
+// device, 192KB of WAV took 3.7s while the same audio as a 24KB MP3 took 1.1s
+// (a plain 180KB POST to an unrelated host took 0.44s, so the link is fine).
+// lame ships on the device, so captures are compressed before upload. Speech at
+// 32kbps mono is well within what Whisper handles.
+func compressForUpload(wavPath string) (string, func()) {
+	noop := func() {}
+
+	if _, err := exec.LookPath("lame"); err != nil {
+		return wavPath, noop
+	}
+
+	mp3Path := strings.TrimSuffix(wavPath, ".wav") + ".mp3"
+	cmd := exec.Command("lame", "--quiet", "-m", "m", "-b", "32", wavPath, mp3Path)
+	if err := cmd.Run(); err != nil {
+		log.Printf("audio: lame encode failed, sending wav: %v", err)
+		os.Remove(mp3Path)
+		return wavPath, noop
+	}
+
+	st, err := os.Stat(mp3Path)
+	if err != nil || st.Size() == 0 {
+		os.Remove(mp3Path)
+		return wavPath, noop
+	}
+
+	return mp3Path, func() { os.Remove(mp3Path) }
+}
+
 func transcribe(provider, apiKey, lang, wavPath string) (string, error) {
 	cfg, ok := providers[provider]
 	if !ok {
 		return "", fmt.Errorf("unknown provider: %s", provider)
 	}
 
-	f, err := os.Open(wavPath)
+	uploadPath, cleanup := compressForUpload(wavPath)
+	defer cleanup()
+
+	f, err := os.Open(uploadPath)
 	if err != nil {
-		return "", fmt.Errorf("open wav: %v", err)
+		return "", fmt.Errorf("open audio: %v", err)
 	}
 	defer f.Close()
 
@@ -66,7 +100,12 @@ func transcribe(provider, apiKey, lang, wavPath string) (string, error) {
 		}
 	}
 
-	part, err := w.CreateFormFile("file", "audio.wav")
+	filename := "audio.wav"
+	if strings.HasSuffix(uploadPath, ".mp3") {
+		filename = "audio.mp3"
+	}
+
+	part, err := w.CreateFormFile("file", filename)
 	if err != nil {
 		return "", err
 	}
