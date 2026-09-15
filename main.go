@@ -122,6 +122,9 @@ var currentNetworkStatus = "offline"
 func main() {
 	wsHub := utils.NewWebSocketHub()
 
+	// Where deploy-wakeword.sh installs the three tflite models.
+	const wakeModelDir = "/etc/nocturne/wakeword"
+
 	btManager, err := bluetooth.NewBluetoothManager(wsHub)
 	if err != nil {
 		log.Fatal("Failed to initialize bluetooth manager:", err)
@@ -963,6 +966,72 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	}))
+
+	// POST /audio/transcribe/wake - arm or disarm "hey spotify" detection.
+	//
+	// Credentials are supplied here rather than at detection time because a
+	// detected phrase must open a session immediately; waiting for a round trip
+	// to the client would lose the beginning of the command. They are the same
+	// credentials /start already receives.
+	http.HandleFunc("/audio/transcribe/wake", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "GET" {
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]bool{"enabled": audioManager.WakeEnabled()})
+			return
+		}
+		if r.Method != "POST" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Method not allowed"})
+			return
+		}
+
+		var req struct {
+			Enabled   bool    `json:"enabled"`
+			Provider  string  `json:"provider"`
+			APIKey    string  `json:"apiKey"`
+			Lang      string  `json:"lang"`
+			ModelDir  string  `json:"modelDir"`
+			Threshold float32 `json:"threshold"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ErrorResponse{Error: "Invalid request body: " + err.Error()})
+			return
+		}
+
+		if !req.Enabled {
+			audioManager.DisableWake()
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{"status": "disabled"})
+			return
+		}
+
+		if req.ModelDir == "" {
+			req.ModelDir = wakeModelDir
+		}
+		if err := audioManager.EnableWake(audio.WakeParams{
+			Models:    audio.WakeModelsFrom(req.ModelDir),
+			Threshold: req.Threshold,
+			StartParams: audio.StartParams{
+				Provider: req.Provider,
+				APIKey:   req.APIKey,
+				Lang:     req.Lang,
+			},
+		}); err != nil {
+			// A build without the wakeword tag has no tflite runtime. That is a
+			// deployment fact, not a bad request, so say so distinctly.
+			if errors.Is(err, audio.ErrWakeUnsupported) {
+				w.WriteHeader(http.StatusNotImplemented)
+			} else {
+				w.WriteHeader(http.StatusBadRequest)
+			}
+			json.NewEncoder(w).Encode(ErrorResponse{Error: err.Error()})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "enabled"})
 	}))
 
 	// POST /audio/transcribe/cancel

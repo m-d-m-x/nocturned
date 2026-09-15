@@ -60,6 +60,18 @@ const (
 	bytesPerSample = 2
 	windowBytes    = int64(sampleRate * bytesPerSample) // the 1s RMS window
 
+	// How far back a session looks to estimate the room's noise floor, in 1s
+	// windows. A wake-word session begins at the end of the phrase, so the
+	// second or two immediately before it is the phrase itself; looking
+	// further back reaches genuine ambient audio.
+	ambientLookbackWindows = 6
+
+	// Silence tolerated before any speech has been heard. A wake-word session
+	// opens the moment the phrase ends, and people pause before starting the
+	// command, so the original 1.4s closed the session before they spoke.
+	// Once speech has been heard, silenceRequired governs the tail.
+	initialSilenceAllowed = 4.0
+
 	// Guard band kept either side of detected speech when trimming.
 	trimPadBytes = int64(0.25 * sampleRate * bytesPerSample)
 	// Never trim down to something too short to be a real utterance.
@@ -94,6 +106,7 @@ func adaptiveThreshold(floor float64) float64 {
 // never opened or closed for it.
 type session struct {
 	startOffset int64
+	seedFloor   float64 // ambient RMS measured before the session opened
 	provider    string
 	apiKey      string
 	lang        string
@@ -116,6 +129,16 @@ type Manager struct {
 	current *session
 	wsHub   *utils.WebSocketHub
 	capture *Capture
+
+	// Wake-word detection. wakeParams holds the credentials a detected phrase
+	// starts a session with; the client supplies them when arming, exactly as
+	// it does for a dial-triggered session.
+	wake       *detector
+	wakeParams StartParams
+	// What the running detector was built with, so a re-arm can tell a
+	// credential refresh from a genuine configuration change.
+	wakeModels    ScorerConfig
+	wakeThreshold float32
 }
 
 // NewManager builds the manager and opens the microphone. Capture is
@@ -127,8 +150,9 @@ func NewManager(wsHub *utils.WebSocketHub) *Manager {
 	return m
 }
 
-// Close releases the microphone.
+// Close stops detection and releases the microphone.
 func (m *Manager) Close() {
+	m.DisableWake()
 	if m.capture != nil {
 		m.capture.Stop()
 	}
@@ -181,12 +205,29 @@ func (m *Manager) Start(p StartParams) error {
 
 	ring := m.capture.Ring()
 	start := ring.Written() - PreRollBytes()
+
+	return m.startLocked(p, start)
+}
+
+// startLocked opens a session beginning at an absolute ring offset. Callers
+// must hold m.mu and have already validated p.
+//
+// The offset matters for the wake-word path: a dial press reaches back by
+// PreRollBytes because the user has already started speaking, whereas a
+// detected phrase supplies the offset where that phrase ended, so the command
+// that follows is captured without the wake word itself being transcribed.
+func (m *Manager) startLocked(p StartParams, start int64) error {
+	ring := m.capture.Ring()
 	if oldest := ring.Oldest(); start < oldest {
 		start = oldest
+	}
+	if written := ring.Written(); start > written {
+		start = written
 	}
 
 	s := &session{
 		startOffset: start,
+		seedFloor:   ambientFloor(ring, start),
 		provider:    p.Provider,
 		apiKey:      p.APIKey,
 		lang:        p.Lang,
@@ -304,7 +345,12 @@ func (m *Manager) Cancel() error {
 func (m *Manager) watchForSilence(s *session) {
 	silenceSecs := 0.0
 	peak := 0.0
-	floor := math.Inf(1)
+	// Seeded from audio captured before the session. Deriving the floor purely
+	// from windows inside the session means the threshold is always at least
+	// three times the quietest window it contains, so a session that is speech
+	// from its first moment can never register any speech at all - which is
+	// exactly what a wake-word session looks like.
+	floor := s.seedFloor
 	ring := m.capture.Ring()
 
 	for {
@@ -361,12 +407,42 @@ func (m *Manager) watchForSilence(s *session) {
 			}
 		}
 
-		if silenceSecs >= silenceRequired {
+		// Before any speech, allow the longer grace period; afterwards the
+		// short trailing silence is what ends the utterance.
+		limit := silenceRequired
+		if s.speechWindows.Load() == 0 {
+			limit = initialSilenceAllowed
+		}
+		if silenceSecs >= limit {
 			log.Printf("audio: %.1fs silence (rms %.0f < %.0f), auto-stopping", silenceSecs, rms, threshold)
 			go m.stop("silence")
 			return
 		}
 	}
+}
+
+// ambientFloor estimates the room's noise level from the audio immediately
+// preceding a session, scanning backwards in 1s windows and taking the
+// quietest. Returns +Inf when the ring holds nothing usable, which leaves the
+// caller with the original behaviour of learning the floor as it goes.
+func ambientFloor(ring *Ring, before int64) float64 {
+	floor := math.Inf(1)
+	oldest := ring.Oldest()
+	for i := 0; i < ambientLookbackWindows; i++ {
+		to := before - int64(i)*windowBytes
+		from := to - windowBytes
+		if from < oldest {
+			break
+		}
+		pcm, err := ring.Read(from, to)
+		if err != nil || len(pcm) < bytesPerSample {
+			break
+		}
+		if r := rmsOfPCM(pcm); r < floor {
+			floor = r
+		}
+	}
+	return floor
 }
 
 func rmsOfPCM(pcm []byte) float64 {

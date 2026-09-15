@@ -60,7 +60,7 @@ type VoiceTranscriptPayload struct {
 // initiate - most importantly the silence detector auto-stopping - so the UI
 // can follow along without owning the stop itself.
 type VoiceStatePayload struct {
-	State string `json:"state"` // recording | transcribing | discarded | cancelled
+	State string `json:"state"` // wake | recording | transcribing | discarded | cancelled
 
 	// Present on "transcribing" so the client can log what was actually
 	// captured: why it stopped, how long, how big, and the RMS that tripped it.
@@ -71,4 +71,8 @@ type VoiceStatePayload struct {
 	FloorRMS   float64 `json:"floorRms,omitempty"`
 	Threshold  float64 `json:"threshold,omitempty"`
 	Windows    uint32  `json:"windows,omitempty"`
+
+	// Present on "wake": how confident the detector was, so the client can
+	// surface or log a marginal trigger.
+	Score float32 `json:"score,omitempty"`
 }

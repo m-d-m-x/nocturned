@@ -27,3 +27,10 @@ go.work.sum
 # Nix
 /result
 /nocturned
+
+# Wake-word build output: the staged payload for deploy-wakeword.ps1. Contains
+# the armhf TFLite runtime, the three tflite models and the cgo binary - around
+# 20MB of regenerable artifacts that must not enter the history.
+/dist-wakeword/
+/nocturned-wake
+/wakescore
